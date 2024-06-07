@@ -4,3 +4,10 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+anyhow = "1.0.86"
+ash = "0.38.0"
+ash-window = "0.13.0"
+car = "0.1.0"
+colorize = "0.1.0"
+inline-spirv = { version = "0.2.1", default-features = false, features = ["glsl"] }
+winit = "0.30.0"
