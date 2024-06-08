@@ -1,4 +1,4 @@
-use std::{ffi::CStr, mem::size_of};
+use std::{f32::consts::PI, ffi::CStr, mem::size_of, time::Instant};
 
 use crate::{
     buffer::Buffer,
@@ -11,11 +11,9 @@ use crate::{
 };
 
 use anyhow::Result;
-use ash::{
-    prelude::VkResult,
-    vk::{self, PFN_vkBindImageMemory},
-};
+use ash::{prelude::VkResult, vk};
 use inline_spirv::include_spirv as i_spirv;
+use ultraviolet::Mat4;
 use winit::{
     application::ApplicationHandler,
     dpi::LogicalSize,
@@ -41,6 +39,11 @@ const MAX_FRAMES_IN_FLIGHT: usize = 2;
 pub struct Renderer {
     window: Option<Window>,
     ctx: Option<Context>,
+
+    pub spin: bool,
+    pub spin_speed: f32,
+    time: Option<Instant>,
+    angle: f32,
 
     surface: vk::SurfaceKHR,
 
@@ -77,6 +80,7 @@ pub struct Renderer {
 
 impl Renderer {
     fn init(&mut self) -> Result<()> {
+        self.time = Some(Instant::now());
         self.create_queues();
         self.create_swapchain()?;
         self.create_pipeline()?;
@@ -185,8 +189,14 @@ impl Renderer {
         let ctx = self.ctx.as_ref().unwrap();
 
         self.pipeline_layout = unsafe {
-            ctx.device
-                .create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default(), None)?
+            ctx.device.create_pipeline_layout(
+                &vk::PipelineLayoutCreateInfo::default().push_constant_ranges(&[
+                    vk::PushConstantRange::default()
+                        .size(size_of::<Mat4>() as _)
+                        .stage_flags(vk::ShaderStageFlags::VERTEX),
+                ]),
+                None,
+            )?
         };
 
         let color_attachment = [vk::AttachmentDescription::default()
@@ -482,6 +492,11 @@ impl Renderer {
         let render_finished_semaphore = self.render_finished_semaphores[self.current_frame];
         let ctx = self.ctx.as_ref().unwrap();
 
+        self.angle = (self.angle
+            + self.time.take().unwrap().elapsed().as_secs_f32() * self.spin_speed)
+            % (2. * PI);
+        self.time = Some(Instant::now());
+
         unsafe {
             ctx.device
                 .wait_for_fences(&[flight_fence], true, u64::MAX)?;
@@ -562,6 +577,19 @@ impl Renderer {
                 vk::IndexType::UINT16,
             );
 
+            ctx.device.cmd_push_constants(
+                command_buffer,
+                self.pipeline_layout,
+                vk::ShaderStageFlags::VERTEX,
+                0,
+                if self.spin {
+                    Mat4::from_rotation_z(self.angle)
+                } else {
+                    Mat4::identity()
+                }
+                .as_byte_slice(),
+            );
+
             ctx.device
                 .cmd_draw_indexed(command_buffer, self.index_count, 1, 0, 0, 0);
             ctx.device.cmd_end_render_pass(command_buffer);
@@ -597,18 +625,15 @@ impl Renderer {
 
 impl ApplicationHandler for Renderer {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        let mut window = None;
-        while let None | Some(Err(_)) = window {
-            window = Some(
-                event_loop.create_window(
-                    Window::default_attributes()
-                        .with_inner_size(LogicalSize::new(WIDTH as f64, HEIGHT as _)),
-                ),
-            );
-        }
+        let window = event_loop
+            .create_window(
+                Window::default_attributes()
+                    .with_inner_size(LogicalSize::new(WIDTH as f64, HEIGHT as _)),
+            )
+            .unwrap();
 
-        self.window = Some(window.unwrap().unwrap());
-        self.ctx = Some(Context::new(self.window.as_ref().unwrap(), &mut self.surface).unwrap());
+        self.ctx = Some(Context::new(&window, &mut self.surface).unwrap());
+        self.window = Some(window);
 
         self.init().unwrap();
     }
