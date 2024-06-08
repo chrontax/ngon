@@ -3,6 +3,7 @@ use std::{ffi::CStr, mem::size_of};
 use crate::{
     buffer::Buffer,
     context::Context,
+    polygon::{indices, vertices},
     utils::{
         choose_swap_extent, choose_swap_present_mode, choose_swap_surface_format,
         QueueFamilyIndices, SwapchainSupportDetails,
@@ -10,7 +11,10 @@ use crate::{
 };
 
 use anyhow::Result;
-use ash::{prelude::VkResult, vk};
+use ash::{
+    prelude::VkResult,
+    vk::{self, PFN_vkBindImageMemory},
+};
 use inline_spirv::include_spirv as i_spirv;
 use winit::{
     application::ApplicationHandler,
@@ -32,13 +36,6 @@ const HEIGHT: u32 = 600;
 const FRAGMENT_SHADER: &[u32] = include_spirv!("src/shader.frag", frag);
 const VERTEX_SHADER: &[u32] = include_spirv!("src/shader.vert", vert);
 const MAX_FRAMES_IN_FLIGHT: usize = 2;
-
-#[rustfmt::skip]
-const VERTICES: [f32; 6] = [
-     0.0, -0.5,
-    -0.5,  0.5,
-     0.5,  0.5
-];
 
 #[derive(Default)]
 pub struct Renderer {
@@ -62,7 +59,10 @@ pub struct Renderer {
     pipeline_layout: vk::PipelineLayout,
     pipeline: vk::Pipeline,
 
+    pub vertex_count: usize,
     vertex_buffer: Buffer,
+    index_count: u32,
+    index_buffer: Buffer,
 
     command_pool: vk::CommandPool,
     command_buffers: Vec<vk::CommandBuffer>,
@@ -83,6 +83,7 @@ impl Renderer {
         self.create_framebuffers()?;
         self.create_cmd()?;
         self.create_vertex_buffer()?;
+        self.create_index_buffer()?;
         self.create_sync()?;
 
         Ok(())
@@ -361,7 +362,7 @@ impl Renderer {
     fn create_vertex_buffer(&mut self) -> Result<()> {
         let ctx = self.ctx.as_ref().unwrap();
 
-        let buffer_size = (size_of::<f32>() * VERTICES.len()) as _;
+        let buffer_size = (size_of::<f32>() * self.vertex_count * 2) as _;
 
         let staging_buffer = Buffer::new(
             ctx,
@@ -377,10 +378,49 @@ impl Renderer {
             buffer_size,
         )?;
 
-        staging_buffer.copy_from(VERTICES.as_ptr() as _, buffer_size as _, ctx)?;
+        staging_buffer.copy_from(
+            vertices(self.vertex_count).as_ptr() as _,
+            buffer_size as _,
+            ctx,
+        )?;
 
         staging_buffer.copy_to(
             &self.vertex_buffer,
+            ctx,
+            self.command_pool,
+            self.graphics_queue,
+        )?;
+        staging_buffer.free(ctx);
+
+        Ok(())
+    }
+
+    fn create_index_buffer(&mut self) -> Result<()> {
+        let ctx = self.ctx.as_ref().unwrap();
+
+        let indices = indices(self.vertex_count);
+        let buffer_size = (size_of::<u16>() * indices.len()) as _;
+
+        self.index_count = indices.len() as _;
+
+        let staging_buffer = Buffer::new(
+            ctx,
+            vk::BufferUsageFlags::TRANSFER_SRC,
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+            buffer_size,
+        )?;
+
+        self.index_buffer = Buffer::new(
+            ctx,
+            vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::INDEX_BUFFER,
+            vk::MemoryPropertyFlags::DEVICE_LOCAL,
+            buffer_size,
+        )?;
+
+        staging_buffer.copy_from(indices.as_ptr() as _, buffer_size as _, ctx)?;
+
+        staging_buffer.copy_to(
+            &self.index_buffer,
             ctx,
             self.command_pool,
             self.graphics_queue,
@@ -515,9 +555,15 @@ impl Renderer {
                 &[self.vertex_buffer.buffer],
                 &[0],
             );
+            ctx.device.cmd_bind_index_buffer(
+                command_buffer,
+                self.index_buffer.buffer,
+                0,
+                vk::IndexType::UINT16,
+            );
 
             ctx.device
-                .cmd_draw(command_buffer, VERTICES.len() as _, 1, 0, 0);
+                .cmd_draw_indexed(command_buffer, self.index_count, 1, 0, 0, 0);
             ctx.device.cmd_end_render_pass(command_buffer);
 
             ctx.device.end_command_buffer(command_buffer).unwrap();
@@ -551,15 +597,18 @@ impl Renderer {
 
 impl ApplicationHandler for Renderer {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        let window = event_loop
-            .create_window(
-                Window::default_attributes()
-                    .with_inner_size(LogicalSize::new(WIDTH as f64, HEIGHT as _)),
-            )
-            .unwrap();
+        let mut window = None;
+        while let None | Some(Err(_)) = window {
+            window = Some(
+                event_loop.create_window(
+                    Window::default_attributes()
+                        .with_inner_size(LogicalSize::new(WIDTH as f64, HEIGHT as _)),
+                ),
+            );
+        }
 
-        self.ctx = Some(Context::new(&window, &mut self.surface).unwrap());
-        self.window = Some(window);
+        self.window = Some(window.unwrap().unwrap());
+        self.ctx = Some(Context::new(self.window.as_ref().unwrap(), &mut self.surface).unwrap());
 
         self.init().unwrap();
     }
@@ -599,6 +648,7 @@ impl Drop for Renderer {
             ctx.device.device_wait_idle().unwrap();
 
             self.vertex_buffer.free(ctx);
+            self.index_buffer.free(ctx);
 
             for &semaphore in self
                 .image_available_semaphores
